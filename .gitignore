@@ -1,0 +1,5 @@
+build/
+work/
+logs/
+evidence/*.bgra
+*.dSYM/
