@@ -1,5 +1,5 @@
 build/
 work/
 logs/
-evidence/*.bgra
+*.bgra
 *.dSYM/

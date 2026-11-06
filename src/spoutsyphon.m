@@ -64,7 +64,7 @@ static void logmsg(const char *fmt, ...) {
 
 // ---------------------------------------------------------------- configuration
 static int cfg_enabled, cfg_fps = 30, cfg_w = 0, cfg_h = 0, cfg_index = -1, cfg_flip = 1, cfg_selftest = 0;
-static int cfg_largest = 1;      // pick the largest accepted texture (stable against small helper textures)
+static int cfg_largest = 1, cfg_probe = 1;      // pick the largest accepted texture (stable against small helper textures)
 static char cfg_conf[256] = "/tmp/spoutsyphon.conf";
 static int cfg_rgba = -1;  // -1 any, 0 bgra, 1 rgba
 static char cfg_name[128] = "VRChat Spout Camera";
@@ -83,6 +83,7 @@ static void read_config(void) {
   if ((e = getenv("SPOUTSYPHON_NAME"))) snprintf(cfg_name, sizeof cfg_name, "%s", e);
   if ((e = getenv("SPOUTSYPHON_CONF"))) snprintf(cfg_conf, sizeof cfg_conf, "%s", e);
   if ((e = getenv("SPOUTSYPHON_PICK"))) cfg_largest = !!strcmp(e, "newest");
+  if ((e = getenv("SPOUTSYPHON_PROBE"))) cfg_probe = atoi(e) != 0;
   if ((e = getenv("SPOUTSYPHON_FORMAT"))) {
     if (!strcasecmp(e, "rgba")) cfg_rgba = 1;
     else if (!strcasecmp(e, "bgra")) cfg_rgba = 0;
@@ -112,6 +113,7 @@ static void reload_conf(void) {
     if (!strcmp(k, "flip")) cfg_flip = atoi(v) != 0;
     else if (!strcmp(k, "fps")) { cfg_fps = atoi(v); if (cfg_fps < 1) cfg_fps = 1; if (cfg_fps > 120) cfg_fps = 120; }
     else if (!strcmp(k, "pick")) cfg_largest = !!strcmp(v, "newest");
+    else if (!strcmp(k, "probe")) cfg_probe = atoi(v) != 0;
     else if (!strcmp(k, "name")) snprintf(cfg_name, sizeof cfg_name, "%s", v);
   }
   fclose(f);
@@ -125,11 +127,18 @@ struct candidate {
   unsigned w, h;
   MTLPixelFormat fmt;
   double t_seen;
+  unsigned long long id;
+  unsigned long long hash;  // last probed content hash, for liveness
 };
 static struct candidate g_cands[32];
 static int g_ncands;
 static pthread_mutex_t g_cand_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_have_new;
+// Selection is liveness-driven: a texture only becomes the published source once it is observed to
+// change. That is what makes a resolution change (VRChat recreates the sender) and stray shared
+// textures (a 640x360 face-mirror helper) behave: the new texture takes over only if it is really live.
+static unsigned long long g_next_id = 1, g_sel_id, g_pending_id;
+static double g_sel_change_t, g_pending_seen_t;
 
 static const char *fmt_name(MTLPixelFormat f) {
   switch (f) {
@@ -167,6 +176,8 @@ static void register_candidate(id<MTLTexture> t, const char *why) {
     g_cands[slot].h = (unsigned)t.height;
     g_cands[slot].fmt = t.pixelFormat;
     g_cands[slot].t_seen = now_s();
+    g_cands[slot].id = g_next_id++;
+    g_cands[slot].hash = 0;
   } else {
     // keep the newest by replacing the oldest slot
     int oldest = 0;
@@ -178,33 +189,31 @@ static void register_candidate(id<MTLTexture> t, const char *why) {
     g_cands[oldest].h = (unsigned)t.height;
     g_cands[oldest].fmt = t.pixelFormat;
     g_cands[oldest].t_seen = now_s();
+    g_cands[oldest].id = g_next_id++;
+    g_cands[oldest].hash = 0;
   }
   pthread_mutex_unlock(&g_cand_lock);
   g_have_new = 1;
+  pthread_mutex_lock(&g_cand_lock);
+  g_pending_id = g_cands[g_ncands - 1].id;  // newest registration is the candidate to try next
+  pthread_mutex_unlock(&g_cand_lock);
+  g_pending_seen_t = now_s();
+}
+
+// ---- candidate access (all under g_cand_lock)
+static struct candidate *cand_by_id_locked(unsigned long long id) {
+  for (int i = 0; i < g_ncands; i++)
+    if (g_cands[i].id == id) return &g_cands[i];
+  return NULL;
 }
 
 // Returns +1 (caller CFRelease()s) so a concurrent replacement cannot free the texture mid-publish.
-static void *pick_candidate(unsigned *w, unsigned *h) {
-  void *out = NULL;
-  pthread_mutex_lock(&g_cand_lock);
-  if (g_ncands > 0) {
-    int i = g_ncands - 1;
-    if (cfg_largest) {
-      unsigned long long best = 0;
-      for (int k = 0; k < g_ncands; k++) {
-        unsigned long long area = (unsigned long long)g_cands[k].w * g_cands[k].h;
-        if (area >= best) { best = area; i = k; }
-      }
-    } else if (cfg_index >= 0 && cfg_index < g_ncands) {
-      i = cfg_index;
-    }
-    out = g_cands[i].tex;
-    CFRetain(out);
-    if (w) *w = g_cands[i].w;
-    if (h) *h = g_cands[i].h;
-  }
-  pthread_mutex_unlock(&g_cand_lock);
-  return out;
+static void *cand_retain_locked(struct candidate *c, unsigned *w, unsigned *h) {
+  if (!c) return NULL;
+  CFRetain(c->tex);
+  if (w) *w = c->w;
+  if (h) *h = c->h;
+  return c->tex;
 }
 
 // ---------------------------------------------------------------- the Metal hook
@@ -279,7 +288,50 @@ static id<MTLCommandQueue> g_queue;
 static volatile int g_stop;
 static unsigned long long g_frames, g_frames_window;
 static double g_t_stats;
+// Source liveness: a small GPU readback of the published texture at ~10 Hz tells us whether the guest is
+// actually producing new frames, independently of our fixed publish rate. This is how "does the camera
+// still update" is measured without instrumenting VRChat.
+static id<MTLTexture> g_probe;
+static MTLPixelFormat g_probe_fmt;
+static unsigned g_probe_w, g_probe_h;
+static unsigned long long g_src_changes, g_src_samples, g_src_window;
 static double g_t_start;
+
+// hash an 8x8 corner of the current source; returns 1 when the content differs from the previous sample.
+static int probe_source(id<MTLTexture> tex, id<MTLCommandQueue> q, unsigned long long *hashp) {
+  if (!tex || !q) return 0;
+  const unsigned PW = 64, PH = 36;
+  if (!g_probe || g_probe_fmt != tex.pixelFormat || g_probe_w != PW || g_probe_h != PH) {
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:tex.pixelFormat
+                                                                                 width:PW height:PH mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead;
+    td.storageMode = MTLStorageModeShared;
+    g_probe = [tex.device newTextureWithDescriptor:td];
+    if (!g_probe) return 0;
+    g_probe_fmt = tex.pixelFormat;
+    g_probe_w = PW;
+    g_probe_h = PH;
+  }
+  id<MTLCommandBuffer> cb = [q commandBuffer];
+  id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
+  // a 64x36 window in the middle of the frame: where a live camera view changes almost every frame
+  [b copyFromTexture:tex sourceSlice:0 sourceLevel:0
+        sourceOrigin:MTLOriginMake(tex.width / 2 - PW / 2, tex.height / 2 - PH / 2, 0)
+          sourceSize:MTLSizeMake(PW, PH, 1)
+             toTexture:g_probe destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+  [b endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+  unsigned char px[64 * 36 * 4];
+  [g_probe getBytes:px bytesPerRow:64 * 4 fromRegion:MTLRegionMake2D(0, 0, PW, PH) mipmapLevel:0];
+  unsigned long long h = 1469598103934665603ULL;
+  for (unsigned i = 0; i < sizeof px; i++) { h ^= px[i]; h *= 1099511628211ULL; }
+  int changed = (h != *hashp);
+  *hashp = h;
+  g_src_samples++;
+  if (changed) { g_src_changes++; g_src_window++; }
+  return changed;
+}
 
 static void publish_tick(CFRunLoopTimerRef timer, void *info) {
   (void)timer;
@@ -288,8 +340,20 @@ static void publish_tick(CFRunLoopTimerRef timer, void *info) {
     static double last_conf;
     double nowc = now_s();
     if (nowc - last_conf >= 1.0) { reload_conf(); last_conf = nowc; }
+
+    void *raw = NULL;
     unsigned w = 0, h = 0;
-    void *raw = pick_candidate(&w, &h);
+    pthread_mutex_lock(&g_cand_lock);
+    struct candidate *sel = cand_by_id_locked(g_sel_id);
+    if (!sel && g_ncands > 0) {  // first candidate ever: adopt the newest and let liveness confirm it
+      sel = &g_cands[g_ncands - 1];
+      g_sel_id = sel->id;
+      g_sel_change_t = 0;
+      logmsg("adopting %ux%u as the source (will confirm it is live)", sel->w, sel->h);
+    }
+    if (sel) raw = cand_retain_locked(sel, &w, &h);
+    pthread_mutex_unlock(&g_cand_lock);
+
     id<MTLTexture> tex = (__bridge id<MTLTexture>)raw;
     if (tex) {
       if (!g_server) {
@@ -308,18 +372,68 @@ static void publish_tick(CFRunLoopTimerRef timer, void *info) {
                               flipped:cfg_flip ? YES : NO];
         [cb commit];
         g_frames++;
+        if (cfg_probe) {
+          pthread_mutex_lock(&g_cand_lock);
+          struct candidate *c = cand_by_id_locked(g_sel_id);
+          int ch = c ? probe_source(tex, g_queue, &c->hash) : 0;
+          pthread_mutex_unlock(&g_cand_lock);
+          if (ch) g_sel_change_t = now_s();
+        }
       }
       CFRelease(raw);
     }
+
+    // A newer shared texture only takes over when it is observed to change; a dead one (VRChat
+    // destroyed the old sender on a resolution change) is dropped after 3 s.
+    if (g_pending_id && g_pending_id != g_sel_id) {
+      void *praw = NULL;
+      unsigned pw = 0, ph = 0;
+      pthread_mutex_lock(&g_cand_lock);
+      struct candidate *pd = cand_by_id_locked(g_pending_id);
+      if (pd) praw = cand_retain_locked(pd, &pw, &ph);
+      int ch = 0;
+      if (pd && cfg_probe) ch = probe_source((__bridge id<MTLTexture>)praw, g_queue, &pd->hash);
+      if (ch) {
+        g_sel_id = g_pending_id;
+        g_sel_change_t = now_s();
+        logmsg("source switched to the live %ux%u texture", pw, ph);
+        g_pending_id = 0;
+      } else if (now_s() - g_pending_seen_t > 3.0) {
+        logmsg("discarded %ux%u: no change within 3 s (stale or unused shared texture)", pw, ph);
+        g_pending_id = 0;
+      }
+      pthread_mutex_unlock(&g_cand_lock);
+      if (praw) CFRelease(praw);
+    }
+
+    // If the published source goes stale and newer candidates exist, test the newest one.
+    if (cfg_probe && g_sel_id && !g_pending_id && now_s() - g_sel_change_t > 2.0) {
+      pthread_mutex_lock(&g_cand_lock);
+      unsigned long long best = 0;
+      double newest = 0;
+      for (int i = 0; i < g_ncands; i++)
+        if (g_cands[i].id != g_sel_id && g_cands[i].t_seen > newest) { newest = g_cands[i].t_seen; best = g_cands[i].id; }
+      if (best) g_pending_id = best;
+      pthread_mutex_unlock(&g_cand_lock);
+      if (best) {
+        g_pending_seen_t = now_s();
+        logmsg("published source has not changed for 2 s; testing a newer candidate");
+      }
+    }
+
     double t = now_s();
     if (g_server && t - g_t_stats >= 1.0) {
       unsigned w2 = 0, h2 = 0;
-      void *cur = pick_candidate(&w2, &h2);
-      if (cur) CFRelease(cur);
-      logmsg("publish %.1f fps, %llu total, source %ux%u, flip=%d, syphon clients=%d",
-             (double)g_frames_window / (t - g_t_stats), g_frames, w2, h2, cfg_flip,
-             g_server ? (int)[g_server hasClients] : 0);
+      pthread_mutex_lock(&g_cand_lock);
+      struct candidate *c = cand_by_id_locked(g_sel_id);
+      if (c) { w2 = c->w; h2 = c->h; }
+      pthread_mutex_unlock(&g_cand_lock);
+      logmsg("publish %.1f fps, %llu total, source %ux%u %supdate %.1f/s, flip=%d, syphon clients=%d",
+             (double)g_frames_window / (t - g_t_stats), g_frames, w2, h2,
+             (g_src_samples && (double)g_src_changes / g_src_samples < 0.2) ? "STALE " : "",
+             (double)g_src_window / (t - g_t_stats), cfg_flip, g_server ? (int)[g_server hasClients] : 0);
       g_frames_window = 0;
+      g_src_window = 0;
       g_t_stats = t;
     }
     g_frames_window++;
@@ -352,41 +466,59 @@ static void *selftest_main(void *arg) {
       return NULL;
     }
     [NSThread sleepForTimeInterval:1.5];
+    id<MTLCommandQueue> q = [d newCommandQueue];
+    id<MTLTexture> cur = nil, stage = nil;
+    size_t W = 1280, H = 720;
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                                                 width:1280
-                                                                                height:720
-                                                                             mipmapped:NO];
+                                                                                 width:W height:H mipmapped:NO];
     td.usage = MTLTextureUsageShaderRead;
     td.storageMode = MTLStorageModePrivate;
-    id<MTLTexture> tex = [d newSharedTextureWithDescriptor:td];
-    logmsg("selftest: shared texture %p %lux%lu", tex, (unsigned long)tex.width, (unsigned long)tex.height);
-    if (!tex) return NULL;
-    // animate through a CPU staging texture + blit so the published frames change every second
+    cur = [d newSharedTextureWithDescriptor:td];
     MTLTextureDescriptor *sd = [td copy];
     sd.storageMode = MTLStorageModeShared;
     sd.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> stage = [d newTextureWithDescriptor:sd];
-    id<MTLCommandQueue> q = [d newCommandQueue];
+    stage = [d newTextureWithDescriptor:sd];
+    logmsg("selftest: shared texture %lux%lu", (unsigned long)cur.width, (unsigned long)cur.height);
+
     for (int i = 0; !g_stop; i++) {
       @autoreleasepool {
-        size_t stride = 1280 * 4;
-        uint8_t *px = malloc(stride * 720);
-        for (int y = 0; y < 720; y++)
-          for (int x = 0; x < 1280; x++) {
+        // at t=6 s, emulate VRChat changing the stream resolution: create a new sender texture and stop
+        // writing the old one. The bridge must notice that the 1280x720 texture died and follow the new one.
+        if (i == 180) {
+          MTLTextureDescriptor *td2 = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                         width:960 height:540 mipmapped:NO];
+          td2.usage = MTLTextureUsageShaderRead;
+          td2.storageMode = MTLStorageModePrivate;
+          id<MTLTexture> t2 = [d newSharedTextureWithDescriptor:td2];
+          MTLTextureDescriptor *sd2 = [td2 copy];
+          sd2.storageMode = MTLStorageModeShared;
+          sd2.usage = MTLTextureUsageShaderRead;
+          id<MTLTexture> st2 = [d newTextureWithDescriptor:sd2];
+          logmsg("selftest: new sender texture %lux%lu (the %zux%zu one stops updating)", (unsigned long)t2.width,
+                 (unsigned long)t2.height, W, H);
+          cur = t2;
+          stage = st2;
+          W = 960;
+          H = 540;
+        }
+        size_t stride = W * 4;
+        uint8_t *px = malloc(stride * H);
+        for (size_t y = 0; y < H; y++)
+          for (size_t x = 0; x < W; x++) {
             uint8_t *p = px + y * stride + x * 4;
-            int inbar = (x > i * 8 % 1280 && x < i * 8 % 1280 + 120);
-            p[0] = inbar ? 255 : (uint8_t)(y * 255 / 720);  // B
-            p[1] = inbar ? 255 : 30;                        // G
-            p[2] = inbar ? 255 : (uint8_t)(x * 255 / 1280); // R
+            int inbar = ((long)x > (long)(i * 8) % (long)W && (long)x < (long)(i * 8) % (long)W + 120);
+            p[0] = inbar ? 255 : (uint8_t)(y * 255 / H);
+            p[1] = inbar ? 255 : (uint8_t)((x + i * 7) % 256);
+            p[2] = inbar ? 255 : (uint8_t)(x * 255 / W);
             p[3] = 255;
           }
-        [stage replaceRegion:MTLRegionMake2D(0, 0, 1280, 720) mipmapLevel:0 withBytes:px bytesPerRow:stride];
+        [stage replaceRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0 withBytes:px bytesPerRow:stride];
         free(px);
         id<MTLCommandBuffer> cb = [q commandBuffer];
         id<MTLBlitCommandEncoder> b = [cb blitCommandEncoder];
         [b copyFromTexture:stage sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
-                  sourceSize:MTLSizeMake(1280, 720, 1)
-                    toTexture:tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+                  sourceSize:MTLSizeMake(W, H, 1)
+                    toTexture:cur destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
         [b endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
