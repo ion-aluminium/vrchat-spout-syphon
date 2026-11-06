@@ -27,6 +27,7 @@
 #import <Syphon/SyphonMetalServer.h>
 
 #include <pthread.h>
+#include <sys/stat.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +41,8 @@ static double now_s(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec + ts.tv_nsec / 1e9;
 }
+static void reload_conf(void);
+
 static void logmsg(const char *fmt, ...) {
   if (!g_log) return;
   struct timespec ts;
@@ -51,7 +54,7 @@ static void logmsg(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   pthread_mutex_lock(&g_log_lock);
-  fprintf(g_log, "%s.%03ld ", stamp, ts.tv_nsec / 1000000);
+  fprintf(g_log, "%s.%03ld [%d] ", stamp, ts.tv_nsec / 1000000, getpid());
   vfprintf(g_log, fmt, ap);
   fputc('\n', g_log);
   fflush(g_log);
@@ -60,7 +63,9 @@ static void logmsg(const char *fmt, ...) {
 }
 
 // ---------------------------------------------------------------- configuration
-static int cfg_enabled, cfg_fps = 30, cfg_w = 0, cfg_h = 0, cfg_index = -1, cfg_flip = 0, cfg_selftest = 0;
+static int cfg_enabled, cfg_fps = 30, cfg_w = 0, cfg_h = 0, cfg_index = -1, cfg_flip = 1, cfg_selftest = 0;
+static int cfg_largest = 1;      // pick the largest accepted texture (stable against small helper textures)
+static char cfg_conf[256] = "/tmp/spoutsyphon.conf";
 static int cfg_rgba = -1;  // -1 any, 0 bgra, 1 rgba
 static char cfg_name[128] = "VRChat Spout Camera";
 
@@ -76,10 +81,42 @@ static void read_config(void) {
   if ((e = getenv("SPOUTSYPHON_FLIP"))) cfg_flip = atoi(e) != 0;
   if ((e = getenv("SPOUTSYPHON_SELFTEST"))) cfg_selftest = atoi(e) != 0;
   if ((e = getenv("SPOUTSYPHON_NAME"))) snprintf(cfg_name, sizeof cfg_name, "%s", e);
+  if ((e = getenv("SPOUTSYPHON_CONF"))) snprintf(cfg_conf, sizeof cfg_conf, "%s", e);
+  if ((e = getenv("SPOUTSYPHON_PICK"))) cfg_largest = !!strcmp(e, "newest");
   if ((e = getenv("SPOUTSYPHON_FORMAT"))) {
     if (!strcasecmp(e, "rgba")) cfg_rgba = 1;
     else if (!strcasecmp(e, "bgra")) cfg_rgba = 0;
   }
+}
+
+// Runtime knobs, re-read once a second so orientation/rate can be corrected without restarting the VM.
+// File format: one `key=value` per line; keys: flip, fps, pick, name. Environment sets the initial values.
+static struct timespec g_conf_mtime;
+static void reload_conf(void) {
+  struct stat st;
+  if (stat(cfg_conf, &st) != 0) return;
+  if (st.st_mtimespec.tv_sec == g_conf_mtime.tv_sec && st.st_mtimespec.tv_nsec == g_conf_mtime.tv_nsec) return;
+  g_conf_mtime = st.st_mtimespec;
+  FILE *f = fopen(cfg_conf, "r");
+  if (!f) return;
+  char line[256];
+  while (fgets(line, sizeof line, f)) {
+    char *eq = strchr(line, '=');
+    if (!eq) continue;
+    *eq = 0;
+    char *k = line, *v = eq + 1;
+    while (*k == ' ' || *k == '\t') k++;
+    while (*v == ' ' || *v == '\t') v++;
+    char *nl = strpbrk(v, "\r\n");
+    if (nl) *nl = 0;
+    if (!strcmp(k, "flip")) cfg_flip = atoi(v) != 0;
+    else if (!strcmp(k, "fps")) { cfg_fps = atoi(v); if (cfg_fps < 1) cfg_fps = 1; if (cfg_fps > 120) cfg_fps = 120; }
+    else if (!strcmp(k, "pick")) cfg_largest = !!strcmp(v, "newest");
+    else if (!strcmp(k, "name")) snprintf(cfg_name, sizeof cfg_name, "%s", v);
+  }
+  fclose(f);
+  logmsg("config reloaded: flip=%d fps=%d pick=%s name='%s'", cfg_flip, cfg_fps, cfg_largest ? "largest" : "newest",
+         cfg_name);
 }
 
 // ---------------------------------------------------------------- candidate registry
@@ -151,7 +188,16 @@ static void *pick_candidate(unsigned *w, unsigned *h) {
   void *out = NULL;
   pthread_mutex_lock(&g_cand_lock);
   if (g_ncands > 0) {
-    int i = cfg_index < 0 ? g_ncands - 1 : (cfg_index < g_ncands ? cfg_index : g_ncands - 1);
+    int i = g_ncands - 1;
+    if (cfg_largest) {
+      unsigned long long best = 0;
+      for (int k = 0; k < g_ncands; k++) {
+        unsigned long long area = (unsigned long long)g_cands[k].w * g_cands[k].h;
+        if (area >= best) { best = area; i = k; }
+      }
+    } else if (cfg_index >= 0 && cfg_index < g_ncands) {
+      i = cfg_index;
+    }
     out = g_cands[i].tex;
     CFRetain(out);
     if (w) *w = g_cands[i].w;
@@ -239,6 +285,9 @@ static void publish_tick(CFRunLoopTimerRef timer, void *info) {
   (void)timer;
   (void)info;
   @autoreleasepool {
+    static double last_conf;
+    double nowc = now_s();
+    if (nowc - last_conf >= 1.0) { reload_conf(); last_conf = nowc; }
     unsigned w = 0, h = 0;
     void *raw = pick_candidate(&w, &h);
     id<MTLTexture> tex = (__bridge id<MTLTexture>)raw;
@@ -263,13 +312,13 @@ static void publish_tick(CFRunLoopTimerRef timer, void *info) {
       CFRelease(raw);
     }
     double t = now_s();
-    if (t - g_t_stats >= 1.0) {
+    if (g_server && t - g_t_stats >= 1.0) {
       unsigned w2 = 0, h2 = 0;
       void *cur = pick_candidate(&w2, &h2);
       if (cur) CFRelease(cur);
-      logmsg("publish %.1f fps over %llu frames, source %ux%u fmt=%s, syphon clients=%d", 
-             (double)g_frames_window / (t - g_t_stats), g_frames, w2, h2,
-             cur ? "?" : "-", g_server ? (int)[g_server hasClients] : 0);
+      logmsg("publish %.1f fps, %llu total, source %ux%u, flip=%d, syphon clients=%d",
+             (double)g_frames_window / (t - g_t_stats), g_frames, w2, h2, cfg_flip,
+             g_server ? (int)[g_server hasClients] : 0);
       g_frames_window = 0;
       g_t_stats = t;
     }
