@@ -19,6 +19,7 @@ separate camera feed (with alpha), not the game window and not the desktop.
 - [Test environment](#test-environment)
 - [Installation](#installation)
 - [Daily use](#daily-use)
+- [Face tracking (VRCFaceTracking + Live Link Face)](#face-tracking-vrcfacetracking--live-link-face)
 - [Measurements](#measurements)
 - [Recovery behaviour](#recovery-behaviour)
 - [Limitations & not verified](#limitations--not-verified)
@@ -243,6 +244,70 @@ what makes VRChat's resolution change (it destroys and recreates the sender) and
 
 ---
 
+## Face tracking (VRCFaceTracking + Live Link Face)
+
+The same project also carries **VRCFaceTracking** face data into VRChat, running side by side with the
+Spout camera path. The two do not share anything: Spout is a GPU/Syphon path with no ports, face tracking
+is OSC over UDP.
+
+### Why a relay
+
+`VRCFaceTracking` is a Windows application and the iPhone's **Live Link Face** app sends to it over UDP.
+The clean split is therefore:
+
+```
+iPhone  --Live Link Face/UDP 11111-->  Windows PC  (VRCFaceTracking + VRCFT_Module_LiveLink.dll)
+                                          │  OSC UDP 127.0.0.1:9000 (VRCFT default)
+                                          ▼
+                                   windows-vrcft-bridge.ps1
+                                          │  OSC UDP -> <mac>:9000
+                                          ▼
+                          vrcft_bridge.py on the Mac  ──127.0.0.1:19000 (gvproxy)──►  guest VRChat :9000
+                                          ▲
+                                          └── OSCQuery proxy on <mac>:19090 (SSH tunnel to VRChat inside the guest)
+```
+
+The VM sits behind user-mode NAT, so the Mac cannot simply forward packets into it: the bridge adds a
+loopback gvproxy forward (`127.0.0.1:19000 → 192.168.127.2:9000`) through the launcher's own API, and
+proxies VRChat's OSCQuery (a random loopback port inside the guest) out to the LAN so VRCFT can read
+`/avatar/change` and the avatar's parameter list.
+
+### Setup
+
+1. **Windows PC** (once): install [VRCFaceTracking](https://github.com/benaclejames/VRCFaceTracking) and
+   drop `VRCFT_Module_LiveLink.dll` into `%AppData%\VRCFaceTracking\CustomLibs` (unblock the DLL).
+   Leave VRCFT's OSC output at its default `127.0.0.1:9000`, and set the iPhone app's Live Link target to
+   the PC's LAN address.
+2. **Windows PC** (each session, after VRCFT is running):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\windows-vrcft-bridge.ps1 -MacIP <mac-lan-ip>
+   ```
+
+   Download it from the Mac at `http://<mac-lan-ip>:19090/windows-vrcft-bridge.ps1`.
+   (Alternative without the script: point VRCFT's OSC IP directly at `<mac-lan-ip>:9000`; you then lose the
+   OSCQuery/avatar-change convenience.)
+3. **Mac**: `scripts/session-up.sh` starts the relay (and the Spout bridge if asked), or
+   `scripts/session-up.sh --no-spout` for face tracking alone.
+
+### What the relay does
+
+| Piece | Detail |
+| --- | --- |
+| OSC listener | UDP `0.0.0.0:9000`, relayed to `127.0.0.1:19000`; source addresses restricted to the listen address's `/24` plus loopback (`--allow` overrides) |
+| gvproxy forward | created through `/tmp/steamac-*/api.sock`, removed again on SIGTERM |
+| OSCQuery proxy | `http://<mac>:19090/` → SSH `-L 19092:127.0.0.1:<vrchat oscquery port>`; also serves `/status` and the Windows helper |
+| Avatar sync | the Windows helper polls `/avatar/change` and replays `/avatar/change` into VRCFT's ports so VRCFT reloads per-avatar parameters |
+
+Status: `scripts/session-status.sh` prints, in one view, whether Spout is injected, whether a Syphon
+server exists, the OSC packet rate and the avatar's face-tracking flags.
+
+> Networking note: the OSC listener is reachable from the local network so the Windows PC can talk to it.
+> It only accepts packets from its own `/24` and only forwards to VRChat's OSC port; stop it with
+> `scripts/session-down.sh` (the forward disappears with it).
+
+---
+
 ## Measurements
 
 ### Staged validation (test sender and real VRChat kept separate)
@@ -345,7 +410,13 @@ src/
   syphon_list.m              enumerate Syphon servers
   hosttest.m                 exercise the dylib without the VM
   windowid.m                 per-window screenshot (evidence capture)
+src/vrcft/
+  vrcft_bridge.py            VRCFT OSC relay + OSCQuery proxy (Mac side)
+  windows-vrcft-bridge.ps1   forwards VRCFT's loopback OSC to the Mac (PC side)
 scripts/
+  session-up.sh              bring up Spout + face tracking together
+  session-status.sh          one view of both halves
+  session-down.sh            stop the face-tracking relay
   build.sh                   build everything
   launch-with-bridge.sh      start the launcher with the bridge injected
   status.sh                  one-shot state check
