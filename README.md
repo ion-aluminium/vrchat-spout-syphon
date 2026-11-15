@@ -228,7 +228,10 @@ The bridge logs one line per sender:
 
 ## Daily use
 
-1. Start the launcher through `scripts/launch-with-bridge.sh` (wrap it in a `.command` for a double-click).
+1. Start the launcher from **`FX Steam Launcher (Spout).app`** (`scripts/make-app.sh --install` builds it).
+   It starts FX with the bridge injected and, if FX is already running *without* the bridge, restarts it
+   injected. Put it in the Dock instead of the original icon. `scripts/launch-with-bridge.sh` does the
+   same from a terminal.
 2. Play normally; open the camera's Spout Stream and the feed appears.
 3. The OBS Syphon source stays put and reconnects even after a VM restart.
 
@@ -293,6 +296,26 @@ proxies VRChat's OSCQuery (a random loopback port inside the guest) out to the L
    OSCQuery/avatar-change convenience.)
 3. **Mac**: `scripts/session-up.sh` starts the relay (and the Spout bridge if asked), or
    `scripts/session-up.sh --no-spout` for face tracking alone.
+
+### What does not work: VRChat's own "Camera Tracking" (Selfie Expression)
+
+VRChat's built-in webcam face tracking **cannot work under Wine/Proton**, and this was verified here
+rather than assumed. VRChat captures through **AVPro Video → Media Foundation**, not DirectShow:
+
+* Installing a DirectShow virtual camera (UnityCapture) into the prefix does make VRChat *list* it as a
+  device — the enumeration path works — but VRChat never asks it for a single frame (the filter's
+  shared-memory objects are never created, and VRChat logs nothing at all).
+* Wine's Media Foundation camera capture is unimplemented; AVProVideo hits
+  `fixme:mfplat:video_processor_ProcessMessage` / `media_engine_IsSeeking` and silently times out.
+* This matches other reports: [Wine bug 58835](https://bugs.winehq.org/show_bug.cgi?id=58835) and
+  [VRChat's forum thread](https://ask.vrchat.com/t/selfie-expression-linux/43839) (VRChat staff: "Proton
+  does not have webcam hooks"), including tests with real UVC cameras, OBS Virtual Camera and
+  v4l2loopback — the device is detected, the capture never starts.
+* The VM cannot help either: the guest kernel has no USB stack or UVC driver and the VMM (libkrun) has no
+  USB passthrough, so no camera device can exist inside the VM in the first place.
+
+The working alternative is the relay described above: tracking happens outside VRChat (VRCFaceTracking on
+a Windows PC, or any tracker that speaks the VRCFT parameter set) and only OSC crosses into the VM.
 
 ### What the relay does
 

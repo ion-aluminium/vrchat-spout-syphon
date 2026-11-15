@@ -106,6 +106,18 @@ The bridge log then shows one `newSharedTexture … ACCEPTED` line per sender:
 15:18:56.707 [33646] syphon server 'VRChat Spout Camera' started on device Apple M5 (source 1920x1080)
 ```
 
+## 5b. Autostart (optional)
+
+```bash
+scripts/make-app.sh --install       # build ~/Applications/FX Steam Launcher (Spout).app
+scripts/install-autostart.sh        # login agent: keeps the dylib copy fresh + starts the VRCFT relay
+scripts/uninstall-autostart.sh      # undo both
+```
+
+`launchctl setenv DYLD_INSERT_LIBRARIES` is ignored by macOS (DYLD_* is protected), so the bridge cannot
+be injected session-wide; the wrapper app is the supported way to make it automatic. The dylib itself is
+gated to the `steamac-vm` executable, so even if it were injected into another app it does nothing.
+
 ## 6. Roll back
 
 | Level | Action |

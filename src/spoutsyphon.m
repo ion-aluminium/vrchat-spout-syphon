@@ -27,6 +27,7 @@
 #import <Syphon/SyphonMetalServer.h>
 
 #include <pthread.h>
+#include <mach-o/dyld.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -530,7 +531,20 @@ static void *selftest_main(void *arg) {
 }
 
 // ---------------------------------------------------------------- entry point
+// Only ever act inside the launcher's VMM process. With the variables set session-wide (so that a
+// normal Dock/Finder launch is injected automatically) this dylib is loaded by every GUI app; the gate
+// keeps it inert everywhere except steamac-vm.
+static int is_steamac_vm(void) {
+  char path[4096];
+  uint32_t size = sizeof path;
+  if (_NSGetExecutablePath(path, &size) != 0) return 0;
+  const char *base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  return strcmp(base, "steamac-vm") == 0;
+}
+
 __attribute__((constructor)) static void spoutsyphon_init(void) {
+  if (!is_steamac_vm()) return;
   read_config();
   if (!cfg_enabled) return;
   const char *lp = getenv("SPOUTSYPHON_LOG");

@@ -39,6 +39,11 @@ done
 [ -d "$APP" ] || { echo "not found: $APP" >&2; exit 1; }
 
 running=$(pgrep -f "FX Steam Launcher.app/Contents/MacOS/steamac-vm" | head -1 || true)
+if [ -n "$running" ] && vmmap "$running" 2>/dev/null | grep -q libSpoutSyphon; then
+  echo "launcher already running with the bridge (pid $running) — bringing it to the front"
+  open -a "$APP"
+  exit 0
+fi
 if [ -n "$running" ]; then
   echo "FX Steam Launcher is running (pid $running). The bridge must be injected at process start,"
   echo "so the launcher has to be restarted. VRChat and the SteamOS session will close."
