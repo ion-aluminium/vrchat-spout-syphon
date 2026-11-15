@@ -47,6 +47,8 @@ state = {
     "osc_last_peer": None,
     "osc_last_address": None,
     "osc_packets_per_sec": 0.0,
+    "osc_dropped": 0,
+    "osc_last_dropped_peer": None,
     "query_upstream_port": None,
     "avatar": None,
     "relay": None,
@@ -152,6 +154,11 @@ def osc_relay(listen, relay_addr, allow_nets, bw):
         payload, peer = sock.recvfrom(65535)
         ip = ipaddress.ip_address(peer[0])
         if not any(ip in net for net in allow_nets):
+            with lock:
+                state["osc_dropped"] += 1
+                state["osc_last_dropped_peer"] = f"{peer[0]}:{peer[1]}"
+            if bw:
+                print(f"osc: DROPPED packet from {peer[0]}:{peer[1]} (not in the allowed ranges)", flush=True)
             continue
         out.sendto(payload, relay_addr)
         with lock:

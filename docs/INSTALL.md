@@ -121,6 +121,7 @@ To confirm the launcher is clean: `pgrep -lf steamac-vm` should show no `libSpou
 
 | Symptom | Cause / fix |
 | --- | --- |
+| OBS shows a black rectangle instead of the camera with a transparent background | the source's **Allow Transparency** is off (OBS draws Syphon frames opaque by default) — tick it in the source properties; `scripts/obs-add-syphon-source.py` sets it |
 | OBS source black, `syphon_list` shows the server | app/server name mismatch in the source settings → `scripts/pin-obs-source.sh` |
 | OBS shows the image upside down | `flip=0` in `/tmp/spoutsyphon.conf`; default 1 is what OBS needs |
 | No `newSharedTexture` line at all | Spout Stream is off in VRChat, or the camera is not in Stream mode |

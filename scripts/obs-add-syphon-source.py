@@ -48,7 +48,8 @@ def main() -> int:
     for s in coll["sources"]:
         if s.get("id") == "syphon-input" and s.get("name") == SOURCE_NAME:
             src_uuid = s["uuid"]
-            s["settings"].update({"name": SERVER_NAME, "uuid": SERVER_UUID, "app_name": SERVER_APP})
+            s["settings"].update({"name": SERVER_NAME, "uuid": SERVER_UUID, "app_name": SERVER_APP,
+                                  "allow_transparency": True})
             print(f"updated existing source {SOURCE_NAME} ({src_uuid})")
             break
     if src_uuid is None:
@@ -60,7 +61,10 @@ def main() -> int:
                 "uuid": src_uuid,
                 "id": "syphon-input",
                 "versioned_id": "syphon-input",
-                "settings": {"name": SERVER_NAME, "uuid": SERVER_UUID, "app_name": SERVER_APP},
+                # Allow Transparency: OBS's mac-syphon draws opaque unless this is on, which shows a
+                # transparent VRChat camera as a black rectangle.
+                "settings": {"name": SERVER_NAME, "uuid": SERVER_UUID, "app_name": SERVER_APP,
+                             "allow_transparency": True},
                 "mixers": 0,
                 "sync": 0,
                 "flags": 0,

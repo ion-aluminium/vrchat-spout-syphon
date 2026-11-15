@@ -194,6 +194,10 @@ scripts/obs-add-syphon-source.py    # OBS must be closed; creates the source by 
 scripts/pin-obs-source.sh           # reads name/app/uuid from the live server, writes them, restarts OBS
 ```
 
+> ⚠️ **Alpha**: in the source's properties tick **Allow Transparency**. `mac-syphon` draws the frame
+> opaque unless it is on (`syphon_video_render` picks the `DrawOpaque` technique), so a VRChat camera with
+> a transparent background shows up as a black rectangle. `scripts/obs-add-syphon-source.py` sets it.
+>
 > ⚠️ OBS's `mac-syphon` only accepts a server announce when **both the app name and the server name match**
 > (or the UUID matches). Syphon takes the app name from the server process's bundle — here
 > **`FX Steam Launcher`**. Adding the source by hand fills this in for you; a source created
