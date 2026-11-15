@@ -139,6 +139,27 @@ def maintain_forward(local, remote, bw):
         time.sleep(5)
 
 
+def local_nets():
+    """Every IPv4 subnet this host is on, so a relay bound to 0.0.0.0 accepts the real LAN.
+
+    (A hardcoded default silently dropped the Windows PC when it lived on 192.168.68.0/24 while the
+    guess was 192.168.0.0/24 - the packets arrived and were discarded.)
+    """
+    nets = []
+    try:
+        out = subprocess.check_output(["ifconfig"], text=True, timeout=3)
+        for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+) netmask (0x[0-9a-fA-F]+)", out):
+            ip, mask = m.group(1), int(m.group(2), 16)
+            if ip.startswith("127."):
+                continue
+            nets.append(ipaddress.ip_network(f"{ip}/{ipaddress.IPv4Address(mask)}", strict=False))
+    except Exception:
+        pass
+    # only the host's real subnets plus loopback: no silent widening to RFC1918 ranges
+    nets.append(ipaddress.ip_network("127.0.0.1/32"))
+    return nets
+
+
 # --------------------------------------------------------------------------- OSC relay
 def osc_relay(listen, relay_addr, allow_nets, bw):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -160,7 +181,14 @@ def osc_relay(listen, relay_addr, allow_nets, bw):
             if bw:
                 print(f"osc: DROPPED packet from {peer[0]}:{peer[1]} (not in the allowed ranges)", flush=True)
             continue
-        out.sendto(payload, relay_addr)
+        try:
+            out.sendto(payload, relay_addr)
+        except OSError as exc:
+            with lock:
+                state["osc_send_errors"] = state.get("osc_send_errors", 0) + 1
+            if bw:
+                print(f"osc: upstream sendto({relay_addr}) failed: {exc}", flush=True)
+            continue
         with lock:
             state["osc_packets"] += 1
             state["osc_last_peer"] = f"{peer[0]}:{peer[1]}"
@@ -261,9 +289,10 @@ def main():
 
     if args.allow:
         nets = [ipaddress.ip_network(c.strip(), strict=False) for c in args.allow.split(",") if c.strip()]
+    elif lhost != "0.0.0.0":
+        nets = [ipaddress.ip_network(lhost + "/24", strict=False)]
     else:
-        base = lhost if lhost != "0.0.0.0" else "192.168.0.0"
-        nets = [ipaddress.ip_network(f"{base.rsplit('.', 1)[0]}.0/24", strict=False)]
+        nets = local_nets()
     nets.append(ipaddress.ip_network("127.0.0.1/32"))
 
     try:
