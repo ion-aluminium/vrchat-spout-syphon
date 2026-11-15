@@ -118,6 +118,25 @@ def osc_address(payload):
         return repr(payload[:24])
 
 
+def maintain_forward(local, remote, bw):
+    """The VM (and therefore gvproxy) can be restarted at any time: keep the forward alive."""
+    global forward_api
+    while True:
+        try:
+            socks = sorted(glob.glob("/tmp/steamac-*/api.sock"),
+                           key=lambda p: Path(p).stat().st_mtime, reverse=True)
+            if not socks:
+                raise RuntimeError("waiting for gvproxy (is FX Steam Launcher running?)")
+            if socks[0] != forward_api:
+                gvproxy_expose(local, remote)
+                if bw:
+                    print(f"gvproxy: forward re-established on {forward_api}", flush=True)
+        except Exception as exc:
+            if bw:
+                print(f"gvproxy: {exc}", flush=True)
+        time.sleep(5)
+
+
 # --------------------------------------------------------------------------- OSC relay
 def osc_relay(listen, relay_addr, allow_nets, bw):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -255,6 +274,9 @@ def main():
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGINT, cleanup)
 
+    threading.Thread(target=maintain_forward,
+                     args=(f"{rhost}:{rport}", "192.168.127.2:9000", not args.quiet),
+                     daemon=True).start()
     threading.Thread(target=osc_relay,
                      args=((lhost, int(lport)), (rhost, int(rport)), nets, not args.quiet),
                      daemon=True).start()
